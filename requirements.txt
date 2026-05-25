@@ -1,0 +1,6 @@
+moviepy>=1.0.3
+librosa>=0.10.0
+numpy
+soundfile
+Pillow
+tkinterdnd2
