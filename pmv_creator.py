@@ -292,8 +292,8 @@ def build_pmv(backend, media_paths, audio_path, output_path,
     log(f"✅ Done in {timedelta(seconds=int(el))} | {sz:.1f} MB → {output_path}")
 
 
-def build_splitscreen(backend, base_pmv, center_media, output_path,
-                       audio_mode="base", custom_audio=None,
+def build_splitscreen(backend, base_pmv, center_media_list, output_path,
+                       audio_mode="base", custom_audio=None, clip_mode="sequential",
                        target_w=1920, target_h=1080, fps=30, quality="medium",
                        progress_cb=None, log_cb=None):
     def log(m):
@@ -301,36 +301,96 @@ def build_splitscreen(backend, base_pmv, center_media, output_path,
     t0 = time.time()
     col_w = target_w // 3
     col_h = target_h
+    td = tempfile.mkdtemp(prefix="pmv_ss_")
+
+    # Determine audio source and extract to WAV for beat detection
+    asrc = base_pmv if audio_mode == "base" else custom_audio
+    temp_wav = os.path.join(td, "ss_audio.wav")
+    backend._run([backend.ffmpeg, "-y", "-i", asrc,
+                  "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1", temp_wav])
+
+    log("⏳ Detecting beats …")
+    bt, adur, bpm = detect_beats(temp_wav)
+    log(f"   ✔ {bpm:.0f} BPM")
+
     log("⏳ Analyzing base PMV …")
     base_info = backend.probe_video(base_pmv)
-    duration = base_info["duration"]
-    log(f"   ✔ Base: {base_info['name']}  {duration:.1f}s")
+    duration = min(base_info["duration"], adur)
+    log(f"   ✔ {base_info['name']}  {duration:.1f}s")
+
     log("⏳ Analyzing center media …")
-    is_img = Path(center_media).suffix.lower() in IMAGE_EXTS
-    c_info = backend.probe_image(center_media) if is_img else backend.probe_video(center_media)
-    if not is_img: duration = min(duration, c_info["duration"])
-    log(f"   ✔ Center: {c_info['name']}")
-    if progress_cb: progress_cb(10)
-    td = tempfile.mkdtemp(prefix="pmv_ss_")
+    c_infos, c_valid = [], []
+    for mp in center_media_list:
+        try:
+            info = backend.probe(mp); c_infos.append(info); c_valid.append(mp)
+            log(f"   ✔ {'🖼' if info['type']=='image' else '🎬'} {info['name']}")
+        except Exception as e: log(f"   ✖ {Path(mp).name}: {e}")
+    if not c_valid: raise RuntimeError("No valid center media!")
+    if progress_cb: progress_cb(12)
+
     sp = (f"scale={col_w}:{col_h}:force_original_aspect_ratio=decrease,"
           f"pad={col_w}:{col_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1")
-    def _col(src, out, extra="", loop=False):
-        vf = sp + (f",{extra}" if extra else "")
-        cmd = [backend.ffmpeg, "-y"]
-        if loop: cmd += ["-loop", "1"]
-        cmd += ["-i", src, "-vf", vf, "-t", f"{duration:.4f}", "-r", str(fps),
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-                "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", out]
-        backend._run(cmd)
+
+    # Left and right columns: base PMV scaled for full duration
     log("⏳ Left column …")
-    left = os.path.join(td, "col_L.mp4"); _col(base_pmv, left)
-    if progress_cb: progress_cb(30)
-    log("⏳ Center column …")
-    center = os.path.join(td, "col_C.mp4"); _col(center_media, center, loop=is_img)
-    if progress_cb: progress_cb(55)
+    left = os.path.join(td, "col_L.mp4")
+    backend._run([backend.ffmpeg, "-y", "-i", base_pmv, "-vf", sp,
+                  "-t", f"{duration:.4f}", "-r", str(fps),
+                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                  "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", left])
+    if progress_cb: progress_cb(28)
+
     log("⏳ Right column (mirrored) …")
-    right = os.path.join(td, "col_R.mp4"); _col(base_pmv, right, extra="hflip")
-    if progress_cb: progress_cb(72)
+    right = os.path.join(td, "col_R.mp4")
+    backend._run([backend.ffmpeg, "-y", "-i", base_pmv, "-vf", sp + ",hflip",
+                  "-t", f"{duration:.4f}", "-r", str(fps),
+                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                  "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", right])
+    if progress_cb: progress_cb(44)
+
+    # Center column: beat-synced clips from center_media_list
+    log("⏳ Building center segments …")
+    bt_filt = [b for b in bt if b <= duration]
+    if not bt_filt or bt_filt[-1] < duration: bt_filt.append(duration)
+    ivs = [(bt_filt[i], bt_filt[i+1]) for i in range(len(bt_filt)-1)]
+    n = len(c_valid)
+    if clip_mode == "random":
+        order = [random.randint(0, n-1) for _ in range(len(ivs))]
+    elif clip_mode == "shuffle":
+        base_ord = list(range(n)); random.shuffle(base_ord)
+        order = (base_ord * ((len(ivs)//n)+1))[:len(ivs)]
+    else:
+        order = [i % n for i in range(len(ivs))]
+    pos = [0.0] * n
+    center_segs = []
+    for idx, (st, en) in enumerate(ivs):
+        sd = en - st
+        if sd < 0.02: continue
+        ci = order[idx]; info = c_infos[ci]; is_img = info["type"] == "image"
+        seg_out = os.path.join(td, f"cseg_{idx:05d}.mp4")
+        p_start = 0
+        if not is_img:
+            p_start = pos[ci]
+            if p_start + sd > info["duration"]:
+                p_start = max(0, random.uniform(0, max(0.01, info["duration"] - sd)))
+            pos[ci] = min(p_start + sd, info["duration"])
+        backend.make_segment(c_valid[ci], is_img, p_start, sd,
+                              seg_out, col_w, col_h, fps,
+                              "random" if is_img else "none", "hard cut", 0.0, "none", False)
+        center_segs.append(seg_out)
+        if progress_cb: progress_cb(44 + int((idx+1)/len(ivs)*26))
+
+    log("⏳ Concat center …")
+    center = os.path.join(td, "col_C.mp4")
+    cf = os.path.join(td, "concat.txt")
+    with open(cf, "w", encoding="utf-8") as f:
+        for s in center_segs:
+            f.write(f"file '{s.replace(chr(92), '/').replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'\n")
+    backend._run([backend.ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", cf,
+                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                  "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", center])
+    if progress_cb: progress_cb(74)
+
     log("⏳ Combining columns …")
     combined = os.path.join(td, "combined.mp4")
     backend._run([backend.ffmpeg, "-y", "-i", left, "-i", center, "-i", right,
@@ -338,17 +398,18 @@ def build_splitscreen(backend, base_pmv, center_media, output_path,
                   "-map", "[out]", "-t", f"{duration:.4f}", "-r", str(fps),
                   "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
                   "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", combined])
-    if progress_cb: progress_cb(85)
+    if progress_cb: progress_cb(87)
+
     log("⏳ Muxing audio …")
     pm = {"fast":("ultrafast","23"),"medium":("medium","20"),"high":("slow","18"),"ultra":("veryslow","16")}
     preset, crf = pm.get(quality, ("medium","20"))
-    asrc = base_pmv if audio_mode == "base" else custom_audio
     r = backend._run([backend.ffmpeg, "-y", "-i", combined, "-i", asrc,
                       "-c:v", "libx264", "-preset", preset, "-crf", crf,
                       "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                       "-shortest", "-movflags", "+faststart", output_path])
     if r.returncode != 0: log(f"   ⚠ {r.stderr[-300:]}")
-    for f in [left, center, right, combined]:
+
+    for f in [left, center, right, combined, cf, temp_wav] + center_segs:
         try: os.remove(f)
         except: pass
     try: os.rmdir(td)
@@ -903,15 +964,8 @@ class PMVCreatorApp(tk.Tk):
             from tkinterdnd2 import DND_FILES
             self.media_list.drop_target_register(DND_FILES)
             self.media_list.dnd_bind("<<Drop>>", self._on_drop)
-            for w in [self.ss_center_zone, self.ss_center_lbl]:
-                w.drop_target_register(DND_FILES)
-                w.dnd_bind("<<Drop>>", self._ss_on_drop)
-                w.dnd_bind("<<DragEnter>>", lambda e: self.ss_center_zone.config(
-                    highlightbackground=self.C["green"], bg=self.C["green_dim"]) or
-                    self.ss_center_lbl.config(bg=self.C["green_dim"]))
-                w.dnd_bind("<<DragLeave>>", lambda e: self.ss_center_zone.config(
-                    highlightbackground=self.C["accent"], bg=self.C["accent_dim"]) or
-                    self.ss_center_lbl.config(bg=self.C["accent_dim"]))
+            self.ss_center_list.drop_target_register(DND_FILES)
+            self.ss_center_list.dnd_bind("<<Drop>>", self._ss_on_drop)
         except: pass
 
     def _on_drop(self, event):
@@ -928,12 +982,12 @@ class PMVCreatorApp(tk.Tk):
     def _build_splitscreen_tab(self, p):
         C = self.C
         self.ss_base_pmv = ""
-        self.ss_center_media = ""
+        self.ss_center_paths = []
         self.ss_audio_mode = tk.StringVar(value="base")
         self.ss_custom_audio = ""
 
         # Section: Base PMV
-        bi = self._card(p, "Base PMV  (used for Left & Right columns)", (0,6))
+        bi = self._card(p, "Base PMV  (Left & Right columns)", (0,6))
         br = tk.Frame(bi, bg=C["card"]); br.pack(fill="x")
         HoverButton(br, text="Browse PMV …", width=120, height=32,
                     bg=C["card2"], fg=C["text"], hover_bg=C["border"],
@@ -945,38 +999,48 @@ class PMVCreatorApp(tk.Tk):
                                      bg=C["card"], fg=C["cyan"])
         self.ss_base_dur.pack(side="right")
 
-        # Section: 3-column visual layout
-        li = self._card(p, "3-Column Layout Preview", (0,6))
-        cols_f = tk.Frame(li, bg=C["card"]); cols_f.pack(anchor="w", pady=4)
+        # Layout diagram
+        dg = self._card(p, "Layout Preview", (0,6))
+        diag = tk.Frame(dg, bg=C["card"]); diag.pack(anchor="w", pady=4)
+        for col_txt, col_bg, bord in [
+            ("LEFT\n(Base PMV)", C["card2"], C["border"]),
+            ("CENTER\n(your videos\nbeat-synced)", C["accent_dim"], C["accent"]),
+            ("RIGHT\n(Base PMV\nmirrored)", C["card2"], C["border"]),
+        ]:
+            fr = tk.Frame(diag, bg=col_bg, width=148, height=78,
+                          highlightbackground=bord, highlightthickness=1)
+            fr.pack(side="left", padx=3); fr.pack_propagate(False)
+            tk.Label(fr, text=col_txt, font=("Segoe UI",8), bg=col_bg,
+                     fg=C["muted"] if col_bg == C["card2"] else C["accent_h"],
+                     justify="center").place(relx=.5, rely=.5, anchor="center")
+        tk.Label(dg, text="Left & right play the base PMV simultaneously. Right side is mirrored.",
+                 font=("Segoe UI",8), bg=C["card"], fg=C["muted"]).pack(anchor="w", pady=(6,0))
 
-        lf = tk.Frame(cols_f, bg=C["card2"], width=130, height=95,
-                      highlightbackground=C["border"], highlightthickness=1)
-        lf.pack(side="left", padx=(0,6)); lf.pack_propagate(False)
-        tk.Label(lf, text="LEFT\n(Base PMV)", font=("Segoe UI",9),
-                 bg=C["card2"], fg=C["muted"]).place(relx=.5, rely=.5, anchor="center")
-
-        self.ss_center_zone = tk.Frame(cols_f, bg=C["accent_dim"], width=190, height=95,
-                                        highlightbackground=C["accent"], highlightthickness=2,
-                                        cursor="hand2")
-        self.ss_center_zone.pack(side="left", padx=4); self.ss_center_zone.pack_propagate(False)
-        self.ss_center_lbl = tk.Label(self.ss_center_zone,
-                                       text="CENTER\n⬇ Drop video/image here",
-                                       font=("Segoe UI",8), bg=C["accent_dim"],
-                                       fg=C["accent_h"], justify="center")
-        self.ss_center_lbl.place(relx=.5, rely=.35, anchor="center")
-        HoverButton(self.ss_center_zone, text="Browse …", width=80, height=22,
-                    bg=C["card2"], fg=C["text"], hover_bg=C["border"],
-                    font=("Segoe UI",8), command=self._ss_browse_center).place(
-                    relx=.5, rely=.78, anchor="center")
-
-        rf = tk.Frame(cols_f, bg=C["card2"], width=130, height=95,
-                      highlightbackground=C["border"], highlightthickness=1)
-        rf.pack(side="left", padx=(6,0)); rf.pack_propagate(False)
-        tk.Label(rf, text="RIGHT\n(Base PMV\nmirrored)", font=("Segoe UI",9),
-                 bg=C["card2"], fg=C["muted"]).place(relx=.5, rely=.5, anchor="center")
-
-        tk.Label(li, text="Tip: left and right columns play the base PMV, right side is horizontally mirrored.",
-                 font=("Segoe UI",8), bg=C["card"], fg=C["muted"]).pack(anchor="w", pady=(8,0))
+        # Center column multi-file list
+        ci = self._card_expand(p, "Center Column Videos  (beat-synced, multiple files)", (0,6))
+        cbr = tk.Frame(ci, bg=C["card"]); cbr.pack(fill="x", pady=(0,8))
+        for txt, cmd in [("+ Files", self._ss_add_center_files),
+                         ("Folder", self._ss_add_center_folder),
+                         ("Remove", self._ss_remove_center_sel),
+                         ("Clear", self._ss_clear_center)]:
+            HoverButton(cbr, text=txt, width=74, height=28, bg=C["card2"],
+                        fg=C["text"], hover_bg=C["border"], font=("Segoe UI",9),
+                        command=cmd).pack(side="left", padx=(0,4))
+        self.ss_center_count = tk.Label(cbr, text="0 files", font=("Segoe UI",9),
+                                         bg=C["card"], fg=C["muted"])
+        self.ss_center_count.pack(side="right")
+        self.ss_center_list = tk.Listbox(
+            ci, selectmode="extended", bg=C["card2"], fg=C["text"],
+            font=("Consolas",10), relief="flat", bd=0, highlightthickness=0,
+            selectbackground=C["accent"], selectforeground="#fff", activestyle="none")
+        self.ss_center_list.pack(fill="both", expand=True, pady=(0,4))
+        cm_row = tk.Frame(ci, bg=C["card"]); cm_row.pack(fill="x", pady=(4,0))
+        tk.Label(cm_row, text="Clip Mode:", font=("Segoe UI",9),
+                 bg=C["card"], fg=C["text2"]).pack(side="left", padx=(0,8))
+        self.ss_clip_mode = tk.StringVar(value="sequential")
+        ttk.Combobox(cm_row, textvariable=self.ss_clip_mode,
+                     values=["sequential","random","shuffle"],
+                     state="readonly", width=16).pack(side="left")
 
         # Section: Audio
         ai = self._card(p, "Audio Source", (0,6))
@@ -1031,27 +1095,54 @@ class PMVCreatorApp(tk.Tk):
                     self.ss_base_dur.config(text=str(timedelta(seconds=int(info["duration"]))))
                 except: pass
 
-    def _ss_browse_center(self):
-        f = filedialog.askopenfilename(title="Select Center Column Media",
+    def _ss_add_center_files(self):
+        files = filedialog.askopenfilenames(title="Center Column – Select Videos / Images",
             filetypes=[("Media"," ".join(f"*{e}" for e in sorted(MEDIA_EXTS))),("All","*.*")])
-        if f: self._ss_set_center(f)
+        for f in files:
+            if f not in self.ss_center_paths:
+                self.ss_center_paths.append(f)
+                icon = "🖼" if Path(f).suffix.lower() in IMAGE_EXTS else "🎬"
+                self.ss_center_list.insert("end", f"  {icon}  {Path(f).name}")
+        self._ss_upd_count()
 
-    def _ss_set_center(self, f):
-        self.ss_center_media = f
-        icon = "🖼" if Path(f).suffix.lower() in IMAGE_EXTS else "🎬"
-        name = Path(f).name
-        self.ss_center_lbl.config(
-            text=f"CENTER\n{icon} {name[:22]}", fg=self.C["green"])
-        self.ss_center_zone.config(highlightbackground=self.C["green"], bg=self.C["green_dim"])
-        self.ss_center_lbl.config(bg=self.C["green_dim"])
+    def _ss_add_center_folder(self):
+        d = filedialog.askdirectory(title="Center Column – Select Folder")
+        if not d: return
+        added = 0
+        for f in sorted(Path(d).iterdir()):
+            if f.suffix.lower() in MEDIA_EXTS and str(f) not in self.ss_center_paths:
+                self.ss_center_paths.append(str(f))
+                icon = "🖼" if f.suffix.lower() in IMAGE_EXTS else "🎬"
+                self.ss_center_list.insert("end", f"  {icon}  {f.name}")
+                added += 1
+        self._log(f"📂 Center: +{added} from {Path(d).name}/")
+        self._ss_upd_count()
+
+    def _ss_remove_center_sel(self):
+        for i in reversed(list(self.ss_center_list.curselection())):
+            self.ss_center_list.delete(i); del self.ss_center_paths[i]
+        self._ss_upd_count()
+
+    def _ss_clear_center(self):
+        self.ss_center_paths.clear(); self.ss_center_list.delete(0, "end")
+        self._ss_upd_count()
+
+    def _ss_upd_count(self):
+        ni = sum(1 for p in self.ss_center_paths if Path(p).suffix.lower() in IMAGE_EXTS)
+        nv = len(self.ss_center_paths) - ni
+        parts = []
+        if nv: parts.append(f"{nv} vid")
+        if ni: parts.append(f"{ni} img")
+        self.ss_center_count.config(text=" + ".join(parts) if parts else "0 files")
 
     def _ss_on_drop(self, event):
         for f in self.tk.splitlist(event.data):
             ext = Path(f).suffix.lower()
-            if ext in MEDIA_EXTS:
-                self._ss_set_center(f); break
-        self.ss_center_zone.config(highlightbackground=self.C["accent"], bg=self.C["accent_dim"])
-        self.ss_center_lbl.config(bg=self.C["accent_dim"])
+            if ext in MEDIA_EXTS and f not in self.ss_center_paths:
+                self.ss_center_paths.append(f)
+                icon = "🖼" if ext in IMAGE_EXTS else "🎬"
+                self.ss_center_list.insert("end", f"  {icon}  {Path(f).name}")
+        self._ss_upd_count()
 
     def _ss_toggle_audio(self):
         if self.ss_audio_mode.get() == "custom":
@@ -1069,8 +1160,8 @@ class PMVCreatorApp(tk.Tk):
     def _ss_render(self):
         if not self.ss_base_pmv:
             return messagebox.showwarning("Splitscreen", "Select a base PMV first!")
-        if not self.ss_center_media:
-            return messagebox.showwarning("Splitscreen", "Add media for the center column!")
+        if not self.ss_center_paths:
+            return messagebox.showwarning("Splitscreen", "Add videos for the center column!")
         if not self.ffmpeg_backend:
             return messagebox.showwarning("Splitscreen", "Configure FFmpeg first (FFmpeg tab)!")
         if self.ss_audio_mode.get() == "custom" and not self.ss_custom_audio:
@@ -1090,9 +1181,10 @@ class PMVCreatorApp(tk.Tk):
                 build_splitscreen(
                     backend=self.ffmpeg_backend,
                     base_pmv=self.ss_base_pmv,
-                    center_media=self.ss_center_media,
+                    center_media_list=list(self.ss_center_paths),
                     output_path=out,
                     audio_mode=audio_mode, custom_audio=custom_audio,
+                    clip_mode=self.ss_clip_mode.get(),
                     target_w=tw, target_h=th, fps=fps, quality=quality,
                     progress_cb=lambda v: self.after(0, lambda val=v: self.ss_progress.__setitem__("value", val)),
                     log_cb=lambda m: self.after(0, self._log, m))
